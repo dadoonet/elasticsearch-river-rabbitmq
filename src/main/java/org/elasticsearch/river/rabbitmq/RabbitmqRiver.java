@@ -20,11 +20,12 @@
 package org.elasticsearch.river.rabbitmq;
 
 import com.rabbitmq.client.*;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.bulk.BulkRequestBuilder;
+import org.elasticsearch.action.bulk.BulkItemResponse;
+import org.elasticsearch.action.bulk.BulkProcessor;
+import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.client.Client;
-import org.elasticsearch.common.collect.Lists;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.collect.Maps;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.jackson.core.JsonFactory;
@@ -41,7 +42,9 @@ import org.elasticsearch.river.RiverSettings;
 import org.elasticsearch.script.ExecutableScript;
 import org.elasticsearch.script.ScriptService;
 
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -68,21 +71,25 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
     private final boolean rabbitExchangeDeclare;
     private final boolean rabbitQueueDurable;
     private final boolean rabbitQueueAutoDelete;
+    private final int numPrefetch;
+    private final int numConsumers;
     private Map rabbitQueueArgs = null; //extra arguments passed to queue for creation (ha settings for example)
     private final TimeValue rabbitHeartbeat;
 
+    private final TimeValue bulkFlushInterval;
+
     private final int bulkSize;
-    private final TimeValue bulkTimeout;
-    private final boolean ordered;
+    private final int maxConcurrentBulk;
 
     private final ExecutableScript bulkScript;
     private final ExecutableScript script;
 
     private volatile boolean closed = false;
 
-    private volatile Thread thread;
+    private Thread[] allConsumers;
 
     private volatile ConnectionFactory connectionFactory;
+    private volatile BulkProcessor bulkProcessor;
 
     @SuppressWarnings({"unchecked"})
     @Inject
@@ -113,6 +120,8 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
             rabbitQueue = XContentMapValues.nodeStringValue(rabbitSettings.get("queue"), "elasticsearch");
             rabbitExchange = XContentMapValues.nodeStringValue(rabbitSettings.get("exchange"), "elasticsearch");
             rabbitRoutingKey = XContentMapValues.nodeStringValue(rabbitSettings.get("routing_key"), "elasticsearch");
+            numPrefetch = XContentMapValues.nodeIntegerValue(rabbitSettings.get("num_prefetch"), 0);
+            numConsumers = XContentMapValues.nodeIntegerValue(rabbitSettings.get("num_consumers"), 1);
 
             rabbitExchangeDeclare = XContentMapValues.nodeBooleanValue(rabbitSettings.get("exchange_declare"), true);
             if (rabbitExchangeDeclare) {
@@ -139,7 +148,6 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
             rabbitHeartbeat = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(
                     rabbitSettings.get("heartbeat"), "30m"), TimeValue.timeValueMinutes(30));
-
         } else {
             rabbitAddresses = new Address[]{ new Address("localhost", AMQP.PROTOCOL.PORT) };
             rabbitUser = "guest";
@@ -153,6 +161,8 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
             rabbitExchangeType = "direct";
             rabbitExchangeDurable = true;
             rabbitRoutingKey = "elasticsearch";
+            numPrefetch = 0;
+            numConsumers = 1;
 
             rabbitExchangeDeclare = true;
             rabbitQueueDeclare = true;
@@ -163,17 +173,23 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
         if (settings.settings().containsKey("index")) {
             Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
+            maxConcurrentBulk = XContentMapValues.nodeIntegerValue(indexSettings.get("max_concurrent_bulk"), 1);
+
             bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
             if (indexSettings.containsKey("bulk_timeout")) {
-                bulkTimeout = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(indexSettings.get("bulk_timeout"), "10ms"), TimeValue.timeValueMillis(10));
-            } else {
-                bulkTimeout = TimeValue.timeValueMillis(10);
+                logger.warn("bulk_timeout is deprecated.");
             }
-            ordered = XContentMapValues.nodeBooleanValue(indexSettings.get("ordered"), false);
+            if (indexSettings.containsKey("ordered")) {
+                logger.warn("ordered is deprecated.");
+            }
+
+            bulkFlushInterval = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(
+                    indexSettings.get("flush_interval"), "5s"), TimeValue.timeValueSeconds(5));
+
         } else {
             bulkSize = 100;
-            bulkTimeout = TimeValue.timeValueMillis(10);
-            ordered = false;
+            maxConcurrentBulk = 1;
+            bulkFlushInterval = TimeValue.timeValueSeconds(5);
         }
         
         if (settings.settings().containsKey("bulk_script_filter")) {
@@ -204,7 +220,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 if(scriptSettings.containsKey("script_lang")) {
                     scriptLang = scriptSettings.get("script_lang").toString();
                 }
-                Map<String, Object> scriptParams = null;
+                Map<String, Object> scriptParams;
                 if (scriptSettings.containsKey("script_params")) {
                     scriptParams = (Map<String, Object>) scriptSettings.get("script_params");
                 } else {
@@ -230,8 +246,49 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
         logger.info("creating rabbitmq river, addresses [{}], user [{}], vhost [{}]", rabbitAddresses, connectionFactory.getUsername(), connectionFactory.getVirtualHost());
 
-        thread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "rabbitmq_river").newThread(new Consumer());
-        thread.start();
+        // Creating bulk processor
+        this.bulkProcessor = BulkProcessor.builder(client, new BulkProcessor.Listener() {
+            @Override
+            public void beforeBulk(long executionId, BulkRequest request) {
+                logger.debug("Going to execute new bulk composed of {} actions", request.numberOfActions());
+            }
+
+            @Override
+            public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+                logger.debug("Executed bulk composed of {} actions", request.numberOfActions());
+                if (response.hasFailures()) {
+                    logger.warn("There was failures while executing bulk", response.buildFailureMessage());
+                    if (logger.isDebugEnabled()) {
+                        for (BulkItemResponse item : response.getItems()) {
+                            if (item.isFailed()) {
+                                logger.debug("Error for {}/{}/{} for {} operation: {}", item.getIndex(),
+                                        item.getType(), item.getId(), item.getOpType(), item.getFailureMessage());
+                            }
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
+                logger.warn("Error executing bulk", failure);
+            }
+        })
+                .setBulkActions(bulkSize)
+                .setConcurrentRequests(maxConcurrentBulk)
+                .setFlushInterval(bulkFlushInterval)
+                .build();
+
+        allConsumers = new Thread[numConsumers];
+        logger.debug("Creating {} thread(s)", numConsumers);
+        for (int i=0; i< numConsumers;i++) {
+            String threadName = "rabbitmq_river#" + i;
+            logger.trace("Creating a new Consumer thread {}", threadName);
+            Thread thread = EsExecutors.daemonThreadFactory(settings.globalSettings(), threadName)
+                    .newThread(new Consumer());
+            thread.start();
+            allConsumers[i]=thread;
+        }
     }
 
     @Override
@@ -241,7 +298,12 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
         }
         logger.info("closing rabbitmq river");
         closed = true;
-        thread.interrupt();
+        for (Thread thread : allConsumers) {
+            thread.interrupt();
+        }
+        if (this.bulkProcessor != null) {
+            this.bulkProcessor.close();
+        }
     }
 
     private class Consumer implements Runnable {
@@ -259,6 +321,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 try {
                     connection = connectionFactory.newConnection(rabbitAddresses);
                     channel = connection.createChannel();
+                    if (numPrefetch != 0) channel.basicQos(numPrefetch);
                 } catch (Exception e) {
                     if (!closed) {
                         logger.warn("failed to created a connection / channel", e);
@@ -314,105 +377,20 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                     }
 
                     if (task != null && task.getBody() != null) {
-                        final List<Long> deliveryTags = Lists.newArrayList();
-
-                        BulkRequestBuilder bulkRequestBuilder = client.prepareBulk();
-
+                        long deliveryTag = task.getEnvelope().getDeliveryTag();
                         try {
-                            processBody(task.getBody(), bulkRequestBuilder);
+                            processBody(task.getBody());
                         } catch (Exception e) {
-                            logger.warn("failed to parse request for delivery tag [{}], ack'ing...", e, task.getEnvelope().getDeliveryTag());
-                            try {
-                                channel.basicAck(task.getEnvelope().getDeliveryTag(), false);
-                            } catch (IOException e1) {
-                                logger.warn("failed to ack [{}]", e1, task.getEnvelope().getDeliveryTag());
-                            }
+                            logger.warn("failed to parse request for delivery tag [{}], ack'ing...", e,
+                                    deliveryTag);
                             continue;
                         }
 
-                        deliveryTags.add(task.getEnvelope().getDeliveryTag());
-
-                        if (bulkRequestBuilder.numberOfActions() < bulkSize) {
-                            // try and spin some more of those without timeout, so we have a bigger bulk (bounded by the bulk size)
-                            try {
-                                while ((task = consumer.nextDelivery(bulkTimeout.millis())) != null) {
-                                    try {
-                                        processBody(task.getBody(), bulkRequestBuilder);
-                                        deliveryTags.add(task.getEnvelope().getDeliveryTag());
-                                    } catch (Throwable e) {
-                                        logger.warn("failed to parse request for delivery tag [{}], ack'ing...", e, task.getEnvelope().getDeliveryTag());
-                                        try {
-                                            channel.basicAck(task.getEnvelope().getDeliveryTag(), false);
-                                        } catch (Exception e1) {
-                                            logger.warn("failed to ack on failure [{}]", e1, task.getEnvelope().getDeliveryTag());
-                                        }
-                                    }
-                                    if (bulkRequestBuilder.numberOfActions() >= bulkSize) {
-                                        break;
-                                    }
-                                }
-                            } catch (InterruptedException e) {
-                                if (closed) {
-                                    break;
-                                }
-                            } catch (ShutdownSignalException sse) {
-                                logger.warn("Received a shutdown signal! initiatedByApplication: [{}], hard error: [{}]", sse,
-                                        sse.isInitiatedByApplication(), sse.isHardError());
-                                if (!closed && sse.isInitiatedByApplication()) {
-                                    logger.error("failed to get next message, reconnecting...", sse);
-                                }
-                                cleanup(0, "failed to get message");
-                                break;
-                            }
-                        }
-
-                        if (logger.isTraceEnabled()) {
-                            logger.trace("executing bulk with [{}] actions", bulkRequestBuilder.numberOfActions());
-                        }
-
-                        if (ordered) {
-                            try {
-                                if (bulkRequestBuilder.numberOfActions() > 0) {
-                                  BulkResponse response = bulkRequestBuilder.execute().actionGet();
-                                  if (response.hasFailures()) {
-                                    // TODO write to exception queue?
-                                    logger.warn("failed to execute" + response.buildFailureMessage());
-                                  }
-                                }
-                                for (Long deliveryTag : deliveryTags) {
-                                    try {
-                                        channel.basicAck(deliveryTag, false);
-                                    } catch (Exception e1) {
-                                        logger.warn("failed to ack [{}]", e1, deliveryTag);
-                                    }
-                                }
-                            } catch (Exception e) {
-                                logger.warn("failed to execute bulk", e);
-                            }
-                        } else {
-                            if (bulkRequestBuilder.numberOfActions()>0) {
-                                bulkRequestBuilder.execute(new ActionListener<BulkResponse>() {
-                                    @Override
-                                    public void onResponse(BulkResponse response) {
-                                        if (response.hasFailures()) {
-                                          // TODO write to exception queue?
-                                          logger.warn("failed to execute" + response.buildFailureMessage());
-                                        }
-                                        for (Long deliveryTag : deliveryTags) {
-                                            try {
-                                                channel.basicAck(deliveryTag, false);
-                                            } catch (Exception e1) {
-                                                logger.warn("failed to ack [{}]", e1, deliveryTag);
-                                            }
-                                        }
-                                    }
-                                    
-                                    @Override
-                                    public void onFailure(Throwable e) {
-                                        logger.warn("failed to execute bulk for delivery tags [{}], not ack'ing", e, deliveryTags);
-                                    }
-                                });
-                            }
+                        // Whatever happened, we ack messages.
+                        try {
+                            channel.basicAck(deliveryTag, false);
+                        } catch (IOException e1) {
+                            logger.warn("failed to ack [{}]", e1, deliveryTag);
                         }
                     }
                 }
@@ -433,7 +411,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
             }
         }
 
-        private void processBody(byte[] body, BulkRequestBuilder bulkRequestBuilder) throws Exception {
+        private void processBody(byte[] body) throws Exception {
             if (body == null) return;
 
             // first, the "full bulk" script
@@ -447,13 +425,13 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
 
             // second, the "doc per doc" script
             if (script != null) {
-                processBodyPerLine(body, bulkRequestBuilder);
+                processBodyPerLine(body);
             } else {
-                bulkRequestBuilder.add(body, 0, body.length, false);
+                bulkProcessor.add(new BytesArray(body), false, null, null);
             }
         }
 
-        private void processBodyPerLine(byte[] body, BulkRequestBuilder bulkRequestBuilder) throws Exception {
+        private void processBodyPerLine(byte[] body) throws Exception {
             BufferedReader reader = new BufferedReader(new StringReader(new String(body)));
 
             JsonFactory factory = new JsonFactory();
@@ -464,7 +442,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                 if (asMap.get("delete") != null) {
                     // We don't touch deleteRequests
                     String newContent = line + "\n";
-                    bulkRequestBuilder.add(newContent.getBytes(), 0, newContent.getBytes().length, false);
+                    bulkProcessor.add(new BytesArray(newContent), false, null, null);
                 } else {
                     // But we send other requests to the script Engine in ctx field
                     Map<String, Object> ctx;
@@ -491,7 +469,7 @@ public class RabbitmqRiver extends AbstractRiverComponent implements River {
                             logger.trace("new bulk request is now: {}", request.toString());
                         }
                         byte[] binRequest = request.toString().getBytes();
-                        bulkRequestBuilder.add(binRequest, 0, binRequest.length, false);
+                        bulkProcessor.add(new BytesArray(request.toString()), false, null, null);
                     }
                 }
             }

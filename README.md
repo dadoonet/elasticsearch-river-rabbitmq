@@ -49,6 +49,8 @@ curl -XPUT 'localhost:9200/_river/my_river/_meta' -d '{
         "queue" : "elasticsearch",
         "exchange" : "elasticsearch",
         "routing_key" : "elasticsearch",
+        "num_prefetch" : 0,
+        "num_consumers" : 1,
         "exchange_declare" : true,
         "exchange_type" : "direct",
         "exchange_durable" : true,
@@ -60,8 +62,7 @@ curl -XPUT 'localhost:9200/_river/my_river/_meta' -d '{
     },
     "index" : {
         "bulk_size" : 100,
-        "bulk_timeout" : "10ms",
-        "ordered" : false
+        "flush_interval" : "5s"
     }
 }'
 ```
@@ -95,12 +96,16 @@ Addresses(host-port pairs) also available. it is useful to taking advantage rabb
 ```
 
 The river is automatically bulking queue messages if the queue is overloaded, allowing for faster catchup with the
-messages streamed into the queue. The `ordered` flag allows to make sure that the messages will be indexed in the
-same order as they arrive in the query by blocking on the bulk request before picking up the next data to be indexed.
-It can also be used as a simple way to throttle indexing.
+messages streamed into the queue.
 
 You can set `heartbeat` option to define heartbeat to RabbitMQ river even if no more messages are intended to be consumed
 (default to `30m`).
+
+`numPrefetch` option controls QoS options for all consumers. Basically it sets the maximum number of
+messages that the server will deliver (0 for unlimited - default).
+
+`numConsumers` option sets the number of parallel consumers you may ask to consume the queue (default to 1). Note that
+it will require more memory and that messages could be processed in a different order than they were injected.
 
 Scripting
 ---------
