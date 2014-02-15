@@ -45,7 +45,8 @@ curl -XPUT 'localhost:9200/_river/my_river/_meta' -d '{
         "queue_bind" : true,
         "queue_durable" : true,
         "queue_auto_delete" : false,
-        "heartbeat" : "30m"
+        "heartbeat" : "30m",
+        "nack_errors" : true
     },
     "index" : {
         "bulk_size" : 100,
@@ -90,6 +91,9 @@ It can also be used as a simple way to throttle indexing.
 
 You can set `heartbeat` option to define heartbeat to RabbitMQ river even if no more messages are intended to be consumed
 (default to `30m`).
+
+By default, when exception happens while executing bulk, failing messages are marked as rejected.
+You can ignore errors and ack messages in any case setting `nack_errors` to `false`.
 
 Scripting
 ---------
